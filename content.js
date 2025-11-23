@@ -20,6 +20,9 @@ let extensionEnabled = true;
 const TOGGLE_KEY = 'extension_enabled';
 const DEFAULT_ENABLED = true;
 
+// Track usernames currently being processed to avoid duplicate requests
+const processingUsernames = new Set();
+
 // Load enabled state
 async function loadEnabledState() {
   try {
@@ -53,6 +56,12 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 // Load cache from persistent storage
 async function loadCache() {
   try {
+    // Check if extension context is still valid
+    if (!chrome.runtime?.id) {
+      console.log('Extension context invalidated, skipping cache load');
+      return;
+    }
+    
     const result = await chrome.storage.local.get(CACHE_KEY);
     if (result[CACHE_KEY]) {
       const cached = result[CACHE_KEY];
@@ -67,13 +76,25 @@ async function loadCache() {
       console.log(`Loaded ${locationCache.size} cached locations (excluding null entries)`);
     }
   } catch (error) {
-    console.error('Error loading cache:', error);
+    // Extension context invalidated errors are expected when extension is reloaded
+    if (error.message?.includes('Extension context invalidated') || 
+        error.message?.includes('message port closed')) {
+      console.log('Extension context invalidated, cache load skipped');
+    } else {
+      console.error('Error loading cache:', error);
+    }
   }
 }
 
 // Save cache to persistent storage
 async function saveCache() {
   try {
+    // Check if extension context is still valid
+    if (!chrome.runtime?.id) {
+      console.log('Extension context invalidated, skipping cache save');
+      return;
+    }
+    
     const cacheObj = {};
     const now = Date.now();
     const expiry = now + (CACHE_EXPIRY_DAYS * 24 * 60 * 60 * 1000);
@@ -88,12 +109,24 @@ async function saveCache() {
     
     await chrome.storage.local.set({ [CACHE_KEY]: cacheObj });
   } catch (error) {
-    console.error('Error saving cache:', error);
+    // Extension context invalidated errors are expected when extension is reloaded
+    if (error.message?.includes('Extension context invalidated') || 
+        error.message?.includes('message port closed')) {
+      console.log('Extension context invalidated, cache save skipped');
+    } else {
+      console.error('Error saving cache:', error);
+    }
   }
 }
 
 // Save a single entry to cache
 async function saveCacheEntry(username, location) {
+  // Check if extension context is still valid
+  if (!chrome.runtime?.id) {
+    console.log('Extension context invalidated, skipping cache entry save');
+    return;
+  }
+  
   locationCache.set(username, location);
   // Debounce saves - only save every 5 seconds
   if (!saveCache.timeout) {
@@ -193,9 +226,14 @@ function makeLocationRequest(screenName) {
           event.data.requestId === requestId) {
         window.removeEventListener('message', handler);
         const location = event.data.location;
+        const isRateLimited = event.data.isRateLimited || false;
         
-        // Cache the result (even if null to avoid repeated failed requests)
-        saveCacheEntry(screenName, location || null);
+        // Only cache if not rate limited (don't cache failures due to rate limiting)
+        if (!isRateLimited) {
+          saveCacheEntry(screenName, location || null);
+        } else {
+          console.log(`Not caching null for ${screenName} due to rate limit`);
+        }
         
         resolve(location || null);
       }
@@ -212,7 +250,8 @@ function makeLocationRequest(screenName) {
     // Timeout after 10 seconds
     setTimeout(() => {
       window.removeEventListener('message', handler);
-      saveCacheEntry(screenName, null); // Cache null to avoid retrying immediately
+      // Don't cache timeout failures - allow retry
+      console.log(`Request timeout for ${screenName}, not caching`);
       resolve(null);
     }, 10000);
   });
@@ -353,18 +392,73 @@ async function addFlagToUsername(usernameElement, screenName) {
     return;
   }
 
-  // Mark as processing to avoid duplicate requests
-  usernameElement.dataset.flagAdded = 'processing';
-  console.log(`Processing flag for ${screenName}...`);
-
-  // Get location
-  const location = await getUserLocation(screenName);
-  console.log(`Location for ${screenName}:`, location);
-  if (!location) {
-    console.log(`No location found for ${screenName}, marking as failed`);
-    usernameElement.dataset.flagAdded = 'failed';
+  // Check if this username is already being processed (prevent duplicate API calls)
+  if (processingUsernames.has(screenName)) {
+    // Wait a bit and check if flag was added by the other process
+    await new Promise(resolve => setTimeout(resolve, 500));
+    if (usernameElement.dataset.flagAdded === 'true') {
+      return;
+    }
+    // If still not added, mark this container as waiting
+    usernameElement.dataset.flagAdded = 'waiting';
     return;
   }
+
+  // Mark as processing to avoid duplicate requests
+  usernameElement.dataset.flagAdded = 'processing';
+  processingUsernames.add(screenName);
+  
+  // Find User-Name container for shimmer placement
+  const userNameContainer = usernameElement.querySelector('[data-testid="UserName"], [data-testid="User-Name"]');
+  
+  // Create and insert loading shimmer
+  const shimmerSpan = createLoadingShimmer();
+  let shimmerInserted = false;
+  
+  if (userNameContainer) {
+    // Try to insert shimmer before handle section (same place flag will go)
+    const handleSection = findHandleSection(userNameContainer, screenName);
+    if (handleSection && handleSection.parentNode) {
+      try {
+        handleSection.parentNode.insertBefore(shimmerSpan, handleSection);
+        shimmerInserted = true;
+      } catch (e) {
+        // Fallback: insert at end of container
+        try {
+          userNameContainer.appendChild(shimmerSpan);
+          shimmerInserted = true;
+        } catch (e2) {
+          console.log('Failed to insert shimmer');
+        }
+      }
+    } else {
+      // Fallback: insert at end of container
+      try {
+        userNameContainer.appendChild(shimmerSpan);
+        shimmerInserted = true;
+      } catch (e) {
+        console.log('Failed to insert shimmer');
+      }
+    }
+  }
+  
+  try {
+    console.log(`Processing flag for ${screenName}...`);
+
+    // Get location
+    const location = await getUserLocation(screenName);
+    console.log(`Location for ${screenName}:`, location);
+    
+    // Remove shimmer
+    if (shimmerInserted && shimmerSpan.parentNode) {
+      shimmerSpan.remove();
+    }
+    
+    if (!location) {
+      console.log(`No location found for ${screenName}, marking as failed`);
+      usernameElement.dataset.flagAdded = 'failed';
+      return;
+    }
 
   // Get flag emoji
   const flag = getCountryFlag(location);
@@ -380,9 +474,11 @@ async function addFlagToUsername(usernameElement, screenName) {
   // Priority: Find the @username link, not the display name link
   let usernameLink = null;
   
+  // Find the User-Name container (reuse from above if available, otherwise find it)
+  const containerForLink = userNameContainer || usernameElement.querySelector('[data-testid="UserName"], [data-testid="User-Name"]');
+  
   // Strategy 1: Find link with @username text content (most reliable - this is the actual handle)
-  const userNameContainer = usernameElement.querySelector('[data-testid="UserName"], [data-testid="User-Name"]');
-  if (userNameContainer) {
+  if (containerForLink) {
     const containerLinks = userNameContainer.querySelectorAll('a[href^="/"]');
     for (const link of containerLinks) {
       const text = link.textContent?.trim();
@@ -400,7 +496,7 @@ async function addFlagToUsername(usernameElement, screenName) {
   }
   
   // Strategy 2: Find any link with @username text in UserName container
-  if (!usernameLink && userNameContainer) {
+  if (!usernameLink && containerForLink) {
     const containerLinks = userNameContainer.querySelectorAll('a[href^="/"]');
     for (const link of containerLinks) {
       const text = link.textContent?.trim();
@@ -461,95 +557,133 @@ async function addFlagToUsername(usernameElement, screenName) {
     return;
   }
 
-  // Add flag emoji after username link
+  // Add flag emoji - place it next to verification badge, before @ handle
   const flagSpan = document.createElement('span');
   flagSpan.textContent = ` ${flag}`;
   flagSpan.setAttribute('data-twitter-flag', 'true');
   flagSpan.style.marginLeft = '4px';
+  flagSpan.style.marginRight = '4px';
   flagSpan.style.display = 'inline';
-  flagSpan.style.color = 'inherit'; // Inherit color from parent
+  flagSpan.style.color = 'inherit';
+  flagSpan.style.verticalAlign = 'middle';
   
-  // Try to insert flag after username link
-  // Twitter wraps the @username link in a div, so we need to insert after that div
+  // userNameContainer should already be found above (line 438)
+  // Verify it exists before proceeding
+  if (!userNameContainer) {
+    console.error(`Could not find UserName container for ${screenName}`);
+    usernameElement.dataset.flagAdded = 'failed';
+    return;
+  }
+  
+  // Find the verification badge (SVG with data-testid="icon-verified")
+  const verificationBadge = userNameContainer.querySelector('[data-testid="icon-verified"]');
+  
+  // Find the handle section - the div that contains the @username link
+  // The structure is: User-Name > div (display name) > div (handle section with @username)
+  const handleSection = Array.from(userNameContainer.querySelectorAll('div')).find(div => {
+    const link = div.querySelector(`a[href="/${screenName}"]`);
+    if (link) {
+      const text = link.textContent?.trim();
+      return text === `@${screenName}`;
+    }
+    return false;
+  });
+
   let inserted = false;
   
-  // Strategy 1: Insert after the parent div of the @username link
-  // The @username link is typically in a div that comes after the display name
-  if (usernameLink.parentNode) {
+  // Strategy 1: Insert right before the handle section div (which contains @username)
+  // The handle section is a direct child of User-Name container
+  if (handleSection && handleSection.parentNode === userNameContainer) {
     try {
-      // Insert right after the parent div
-      usernameLink.parentNode.parentNode?.insertBefore(flagSpan, usernameLink.parentNode.nextSibling);
-      if (flagSpan.parentNode) {
-        inserted = true;
-      }
+      userNameContainer.insertBefore(flagSpan, handleSection);
+      inserted = true;
+      console.log(`✓ Inserted flag before handle section for ${screenName}`);
     } catch (e) {
-      console.log('Failed to insert after parent div:', e);
+      console.log('Failed to insert before handle section:', e);
     }
   }
   
-  // Strategy 2: Insert right after the link in its immediate parent
-  if (!inserted && usernameLink.parentNode) {
+  // Strategy 2: Find the handle section's parent and insert before it
+  if (!inserted && handleSection && handleSection.parentNode) {
     try {
-      usernameLink.parentNode.insertBefore(flagSpan, usernameLink.nextSibling);
-      if (flagSpan.parentNode) {
+      // Insert before the handle section's parent (if it's not User-Name)
+      const handleParent = handleSection.parentNode;
+      if (handleParent !== userNameContainer && handleParent.parentNode) {
+        handleParent.parentNode.insertBefore(flagSpan, handleParent);
         inserted = true;
+        console.log(`✓ Inserted flag before handle parent for ${screenName}`);
+      } else if (handleParent === userNameContainer) {
+        // Handle section is direct child, insert before it
+        userNameContainer.insertBefore(flagSpan, handleSection);
+        inserted = true;
+        console.log(`✓ Inserted flag before handle section (direct child) for ${screenName}`);
       }
     } catch (e) {
-      console.log('Failed to insert after link:', e);
+      console.log('Failed to insert before handle parent:', e);
     }
   }
   
-  // Strategy 3: Find the container div that holds both name and handle, insert after handle div
-  if (!inserted) {
-    const userNameContainer = usernameLink.closest('[data-testid="UserName"], [data-testid="User-Name"]');
-    if (userNameContainer) {
-      // Find the div that contains the @username link
-      const handleDiv = usernameLink.closest('div');
-      if (handleDiv && handleDiv.parentNode) {
-        try {
-          handleDiv.parentNode.insertBefore(flagSpan, handleDiv.nextSibling);
-          if (flagSpan.parentNode) {
+  // Strategy 3: Find display name container and insert after it, before handle section
+  if (!inserted && handleSection) {
+    try {
+      // Find the display name link (first link)
+      const displayNameLink = userNameContainer.querySelector('a[href^="/"]');
+      if (displayNameLink) {
+        // Find the div that contains the display name link
+        const displayNameContainer = displayNameLink.closest('div');
+        if (displayNameContainer && displayNameContainer.parentNode) {
+          // Check if handle section is a sibling
+          if (displayNameContainer.parentNode === handleSection.parentNode) {
+            displayNameContainer.parentNode.insertBefore(flagSpan, handleSection);
             inserted = true;
+            console.log(`✓ Inserted flag between display name and handle (siblings) for ${screenName}`);
+          } else {
+            // Try inserting after display name container
+            displayNameContainer.parentNode.insertBefore(flagSpan, displayNameContainer.nextSibling);
+            inserted = true;
+            console.log(`✓ Inserted flag after display name container for ${screenName}`);
           }
-        } catch (e) {
-          console.log('Failed to insert after handle div:', e);
         }
       }
+    } catch (e) {
+      console.log('Failed to insert after display name:', e);
     }
   }
   
-  // Strategy 4: Insert at end of User-Name container (fallback)
-  if (!inserted) {
-    const userNameContainer = usernameLink.closest('[data-testid="UserName"], [data-testid="User-Name"]');
-    if (userNameContainer) {
-      try {
-        userNameContainer.appendChild(flagSpan);
-        inserted = true;
-      } catch (e) {
-        console.log('Failed to append to UserName container:', e);
-      }
-    }
-  }
-  
-  // Strategy 5: Append to the link itself (last resort)
+  // Strategy 4: Insert at the end of User-Name container (fallback)
   if (!inserted) {
     try {
-      usernameLink.appendChild(flagSpan);
+      userNameContainer.appendChild(flagSpan);
       inserted = true;
+      console.log(`✓ Inserted flag at end of UserName container for ${screenName}`);
     } catch (e) {
-      console.error('Failed to append flag to link:', e);
+      console.error('Failed to append flag to User-Name container:', e);
     }
   }
   
-  if (inserted) {
-    // Mark as processed
-    usernameElement.dataset.flagAdded = 'true';
-    console.log(`✓ Successfully added flag ${flag} for ${screenName} (${location})`);
-  } else {
-    console.error(`✗ Failed to insert flag for ${screenName} - tried all strategies`);
-    console.error('Username link:', usernameLink);
-    console.error('Parent structure:', usernameLink.parentNode);
-    usernameElement.dataset.flagAdded = 'failed';
+    if (inserted) {
+      // Mark as processed
+      usernameElement.dataset.flagAdded = 'true';
+      console.log(`✓ Successfully added flag ${flag} for ${screenName} (${location})`);
+      
+      // Also mark any other containers waiting for this username
+      const waitingContainers = document.querySelectorAll(`[data-flag-added="waiting"]`);
+      waitingContainers.forEach(container => {
+        const waitingUsername = extractUsername(container);
+        if (waitingUsername === screenName) {
+          // Try to add flag to this container too
+          addFlagToUsername(container, screenName).catch(() => {});
+        }
+      });
+    } else {
+      console.error(`✗ Failed to insert flag for ${screenName} - tried all strategies`);
+      console.error('Username link:', usernameLink);
+      console.error('Parent structure:', usernameLink.parentNode);
+      usernameElement.dataset.flagAdded = 'failed';
+    }
+  } finally {
+    // Remove from processing set
+    processingUsernames.delete(screenName);
   }
 }
 

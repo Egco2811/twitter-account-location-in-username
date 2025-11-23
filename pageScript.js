@@ -162,11 +162,13 @@
         }
         
         // Send response back to content script via postMessage
+        // Include error status so content script knows not to cache on rate limit
         window.postMessage({
           type: '__locationResponse',
           screenName,
           location,
-          requestId
+          requestId,
+          isRateLimited: response.status === 429
         }, '*');
       } catch (error) {
         console.error('Error fetching location:', error);
