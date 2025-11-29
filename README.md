@@ -1,3 +1,7 @@
+## Fork Changes
+
+Updated manifest json and various other files for Firefox compatibility 
+
 # Twitter Account Location Flag Chrome Extension
 
 A Chrome extension that displays country flag emojis next to Twitter/X usernames based on the account's location information.

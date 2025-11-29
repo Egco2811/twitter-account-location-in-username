@@ -1,35 +1,30 @@
-// Popup script for extension toggle
+// popup.js
+const runtime = typeof browser !== 'undefined' ? browser : chrome;
 const TOGGLE_KEY = 'extension_enabled';
 const DEFAULT_ENABLED = true;
 
-// Get toggle element
 const toggleSwitch = document.getElementById('toggleSwitch');
 const status = document.getElementById('status');
 
-// Load current state
-chrome.storage.local.get([TOGGLE_KEY], (result) => {
+runtime.storage.local.get([TOGGLE_KEY], (result) => {
   const isEnabled = result[TOGGLE_KEY] !== undefined ? result[TOGGLE_KEY] : DEFAULT_ENABLED;
   updateToggle(isEnabled);
 });
 
-// Toggle click handler
 toggleSwitch.addEventListener('click', () => {
-  chrome.storage.local.get([TOGGLE_KEY], (result) => {
+  runtime.storage.local.get([TOGGLE_KEY], (result) => {
     const currentState = result[TOGGLE_KEY] !== undefined ? result[TOGGLE_KEY] : DEFAULT_ENABLED;
     const newState = !currentState;
     
-    chrome.storage.local.set({ [TOGGLE_KEY]: newState }, () => {
+    runtime.storage.local.set({ [TOGGLE_KEY]: newState }, () => {
       updateToggle(newState);
       
-      // Notify content script to update
-      chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      runtime.tabs.query({ active: true, currentWindow: true }, (tabs) => {
         if (tabs[0]) {
-          chrome.tabs.sendMessage(tabs[0].id, {
+          runtime.tabs.sendMessage(tabs[0].id, {
             type: 'extensionToggle',
             enabled: newState
-          }).catch(() => {
-            // Tab might not have content script loaded yet, that's okay
-          });
+          }).catch(() => {});
         }
       });
     });
@@ -47,4 +42,3 @@ function updateToggle(isEnabled) {
     status.style.color = '#536471';
   }
 }
-
